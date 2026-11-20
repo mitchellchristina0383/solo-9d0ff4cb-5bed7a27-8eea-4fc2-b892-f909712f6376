@@ -41,6 +41,7 @@ SOURCE_DIR=$PWD/sample/source OUTPUT_ROOT=$PWD/outputs \
 | POST | `/jobs/{job_id}/resume` | 失败/重启后续做；已完成分片自动跳过 |
 | GET | `/jobs/{job_id}/shards/{rank}/meta` | 该 rank 的区间 `[start, end)` 与原始步数 |
 | GET | `/jobs/{job_id}/shards/{rank}/download?part=weights\|momentum` | 下载分片；任务未全部完成时 409 |
+| POST | `/backup/plan` | 备份扩容试算：给已完成任务的分片规划跨机架副本（只出计划） |
 
 ```bash
 # 发起（source_dir 缺省用挂载的 SOURCE_DIR，也可显式覆盖）
@@ -53,6 +54,70 @@ curl -X POST localhost:8000/jobs/<job_id>/resume
 # 整组完成后下载
 curl -OJ "localhost:8000/jobs/<job_id>/shards/0/download?part=weights"
 ```
+
+## 备份扩容试算（`POST /backup/plan`，只出计划）
+
+检查点按分片分开存放；整架停机时也要能取回全部分片，因此每个分片都需要
+**跨机架副本**。管理员选一批**已完成**的重分片任务，上报各备份卷的所属机架、
+剩余字节和已有的完整分片，并指定**唯一可扩容**的卷，服务试算一份扩容计划：
+
+- 只在**一个机架**上有副本的分片 → 各补一份到别的机架，响应给出每份新副本的
+  源卷和目标卷（`placements[]`）；
+- 可扩容卷**至少要增加的字节数**（`min_expand_bytes`，已扣除其现有余量）；
+  其他卷绝不超出余量（`volumes[].remaining_bytes ≥ 0`）；
+- 排不了的分片在 `unplaced[]` 里给出原因（`code`）：
+  - `no_source_replica`：提交的卷都不持有该分片，没有可复制的源；
+  - `no_eligible_rack`：所有卷都和现有副本同机架；
+  - `insufficient_capacity`：别的机架上没有装得下它的卷，可扩容卷又同架；
+  - `capacity_contention`：单个都放得下，但整批合计超过别的机架的总余量
+    （此时整组待补分片都不落位，不替管理员挑"谁先谁后"）。
+
+规则与限制：
+
+- 分片大小按任务区间计算：`(end - start) × 4 字节 × 2` —— **权重和动量同卷
+  存放**，一个副本两份一起算；
+- 已在 ≥2 个机架有副本的分片自动跳过（计入 `redundant_shards`）；
+- 每次最多试算 **10 个待补分片**、**5 个卷**，超出返回 422；
+- 放置用精确搜索（不是贪心）：多个分片争用卷空间时，给出的可扩容卷增加字节数
+  是最小的；
+- 只出计划：不复制数据、不改任务状态。卷的"剩余字节"和"已有分片"由管理员如实
+  上报，服务只校验分片属于所选任务，无法核实远端卷的真实内容。
+
+### /docs 演示（Docker Compose）
+
+`docker compose up --build` 之后，全部可以在 http://localhost:8000/docs 点出来：
+
+1. `POST /reshard` 提交 `{"new_world_size": 6}`。样例 + 默认挂载下任务 id 固定为
+   `94dd65ae4907a5c3`（改过样例或挂载路径则以 `GET /jobs` 实际返回为准），
+   轮询到 `status == "done"`。
+2. `POST /backup/plan` —— /docs 的示例请求体就是下面这份（把
+   `<job_id from POST /reshard>` 全部换成上一步的 id）：6 个分片都在 rack-a 的
+   `vol-a1` 上，rack-b 的 `vol-b1` 余量 30000，rack-c 的 `vol-c1` 余量 8000
+   且是唯一可扩容卷。
+
+```json
+{
+  "job_ids": ["94dd65ae4907a5c3"],
+  "volumes": [
+    {"volume_id": "vol-a1", "rack": "rack-a", "free_bytes": 20000,
+     "shards": [{"job_id": "94dd65ae4907a5c3", "rank": 0},
+                {"job_id": "94dd65ae4907a5c3", "rank": 1},
+                {"job_id": "94dd65ae4907a5c3", "rank": 2},
+                {"job_id": "94dd65ae4907a5c3", "rank": 3},
+                {"job_id": "94dd65ae4907a5c3", "rank": 4},
+                {"job_id": "94dd65ae4907a5c3", "rank": 5}]},
+    {"volume_id": "vol-b1", "rack": "rack-b", "free_bytes": 30000, "shards": []},
+    {"volume_id": "vol-c1", "rack": "rack-c", "free_bytes": 8000,  "shards": []}
+  ],
+  "expandable_volume": "vol-c1"
+}
+```
+
+3. 响应（要点）：每个分片 13336~13344 字节（区间约 1668 元素 × 4 × 2）；
+   rank 1、2 落到 `vol-b1`（用掉 26688，余 3312，不超余量），rank 0、3、4、5
+   落到 `vol-c1`（共 53368），`min_expand_bytes = 45368` —— 即 `vol-c1` 在现有
+   8000 余量之外至少还要扩这么多。把 `vol-c1` 的 `free_bytes` 改大再试，
+   `min_expand_bytes` 会相应减小，直至 0。
 
 ## 源清单格式
 
@@ -102,7 +167,9 @@ python -m pytest tests/ -q
 ```
 
 覆盖：均分数学、清单校验（缺口/重叠/大小/路径穿越）、端到端字节级一致性、
-中断续做（完整分片不重写）、重启后复用、源变更检测、下载闸门、API 全流程。
+中断续做（完整分片不重写）、重启后复用、源变更检测、下载闸门、API 全流程，
+以及备份试算（跨机架放置、可扩容卷增长、多分片争用卷空间、10 分片/5 卷上限、
+输入校验）。
 
 ## 已知限制
 
@@ -110,3 +177,5 @@ python -m pytest tests/ -q
 - 下载按文件提供（weights/momentum 分开），未提供打包归档接口。
 - 源文件在任务创建后被**同尺寸同步数**篡改无法识别（未做内容校验和）。
 - `new_world_size > total_length` 会被拒绝（每个进程至少分到一个元素）。
+- 备份试算只出计划、不执行复制；计划的正确性取决于管理员上报的卷余量与
+  已有分片是否属实（服务无法核实远端备份卷）。

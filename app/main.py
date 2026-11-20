@@ -7,19 +7,29 @@ Flow (all interactive via /docs):
   GET  /jobs/{job_id}/shards/{rank}/meta     interval + original step per rank
   GET  /jobs/{job_id}/shards/{rank}/download?part=weights|momentum
                                              gated: 409 until the whole job is done
+  POST /backup/plan                          what-if: plan cross-rack backup
+                                             replicas for completed jobs
 """
 
 from __future__ import annotations
 
 import os
 import threading
+from dataclasses import asdict
 from pathlib import Path
 from typing import Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
+from .backup import (
+    MAX_VOLUMES,
+    BackupPlan,
+    BackupPlanError,
+    VolumeInput,
+    plan_backup,
+)
 from .engine import DEFAULT_CHUNK_BYTES, execute_job
 from .jobs import (
     MOMENTUM_NAME,
@@ -82,6 +92,125 @@ def _job_out(job: Job) -> JobOut:
     )
 
 
+_JOB_ID_PLACEHOLDER = "<job_id from POST /reshard>"
+
+
+class ShardRef(BaseModel):
+    """A complete shard already stored on a backup volume."""
+
+    job_id: str = Field(..., min_length=1)
+    rank: int = Field(..., ge=0)
+
+
+class VolumeIn(BaseModel):
+    """One backup volume: its rack, bytes still free, and the complete shards
+    it already holds.  ``free_bytes`` is the space left *now* (the held shards
+    are already paid for); the shard list only fixes replica placement."""
+
+    volume_id: str = Field(..., min_length=1, max_length=64)
+    rack: str = Field(..., min_length=1, max_length=64)
+    free_bytes: int = Field(..., ge=0)
+    shards: list[ShardRef] = Field(default_factory=list)
+
+
+class BackupPlanRequest(BaseModel):
+    """What-if input: completed jobs + candidate backup volumes + the single
+    expandable volume.  Plan only — nothing is copied."""
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "job_ids": [_JOB_ID_PLACEHOLDER],
+                    "volumes": [
+                        {
+                            "volume_id": "vol-a1",
+                            "rack": "rack-a",
+                            "free_bytes": 20000,
+                            "shards": [
+                                {"job_id": _JOB_ID_PLACEHOLDER, "rank": r}
+                                for r in range(6)
+                            ],
+                        },
+                        {"volume_id": "vol-b1", "rack": "rack-b",
+                         "free_bytes": 30000, "shards": []},
+                        {"volume_id": "vol-c1", "rack": "rack-c",
+                         "free_bytes": 8000, "shards": []},
+                    ],
+                    "expandable_volume": "vol-c1",
+                }
+            ]
+        }
+    )
+
+    job_ids: list[str] = Field(
+        ..., min_length=1, description="completed (done) reshard jobs to protect"
+    )
+    volumes: list[VolumeIn] = Field(
+        ..., min_length=1, max_length=MAX_VOLUMES,
+        description=f"candidate backup volumes (at most {MAX_VOLUMES})",
+    )
+    expandable_volume: str = Field(
+        ..., description="the one volume allowed to grow past its remaining bytes"
+    )
+
+
+class PlacementOut(BaseModel):
+    job_id: str
+    rank: int
+    size_bytes: int
+    source_volume: str
+    source_rack: str
+    target_volume: str
+    target_rack: str
+
+
+class UnplacedOut(BaseModel):
+    job_id: str
+    rank: int
+    size_bytes: int
+    code: str
+    reason: str
+
+
+class VolumePlanOut(BaseModel):
+    volume_id: str
+    rack: str
+    expandable: bool
+    free_bytes: int
+    planned_bytes: int
+    remaining_bytes: int
+    min_grow_bytes: int
+
+
+class BackupPlanOut(BaseModel):
+    feasible: bool
+    job_ids: list[str]
+    total_shards: int
+    redundant_shards: int
+    backfill_shards: int
+    placements: list[PlacementOut]
+    unplaced: list[UnplacedOut]
+    volumes: list[VolumePlanOut]
+    expandable_volume: str
+    min_expand_bytes: int
+
+
+def _plan_out(plan: BackupPlan) -> BackupPlanOut:
+    return BackupPlanOut(
+        feasible=plan.feasible,
+        job_ids=list(plan.job_ids),
+        total_shards=plan.total_shards,
+        redundant_shards=plan.redundant_shards,
+        backfill_shards=plan.backfill_shards,
+        placements=[PlacementOut(**asdict(p)) for p in plan.placements],
+        unplaced=[UnplacedOut(**asdict(u)) for u in plan.unplaced],
+        volumes=[VolumePlanOut(**asdict(v)) for v in plan.volumes],
+        expandable_volume=plan.expandable_volume,
+        min_expand_bytes=plan.min_expand_bytes,
+    )
+
+
 class Runner:
     """Serialises execution per job; threads for async, inline when sync_execution."""
 
@@ -120,12 +249,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(
         title="Checkpoint Reshard API",
-        version="1.0.0",
+        version="1.1.0",
         description=(
             "Re-shard a float32 training checkpoint (weights + momentum) from a "
             "read-only source volume to a new process count. Source segments with "
             "gaps or overlaps are rejected. Fully written rank shards are reused "
-            "on resume; downloads open only when the whole job is complete."
+            "on resume; downloads open only when the whole job is complete. "
+            "POST /backup/plan additionally trials cross-rack backup expansion "
+            "for completed jobs (plan only, nothing is copied)."
         ),
     )
     app.state.store = store
@@ -226,6 +357,47 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=409, detail=f"shard {rank} {part} not on disk yet")
         return FileResponse(path, media_type="application/octet-stream",
                             filename=f"{job.job_id}-rank{rank:05d}-{name}")
+
+    @app.post("/backup/plan", response_model=BackupPlanOut)
+    def backup_plan(req: BackupPlanRequest) -> BackupPlanOut:
+        """Trial a cross-rack backup expansion (plan only, nothing is copied).
+
+        Every shard of the selected *completed* jobs that has replicas on only
+        one rack gets one new replica on a different rack.  The response names
+        the target volume for each new replica and the minimum bytes the
+        expandable volume must grow; all other volumes stay within their
+        remaining bytes.  Shards with no source replica, or that cannot be
+        placed, come back with an explicit reason.
+        """
+        job_ids = list(dict.fromkeys(req.job_ids))  # dedupe, keep order
+        jobs: dict[str, Job] = {}
+        for jid in job_ids:
+            job = store.get(jid)
+            if job is None:
+                raise HTTPException(status_code=404, detail=f"unknown job {jid!r}")
+            if job.status != "done":
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"job {jid!r} is {job.status}: backup planning only covers "
+                        "completed jobs"
+                    ),
+                )
+            jobs[jid] = job
+        volumes = [
+            VolumeInput(
+                volume_id=v.volume_id,
+                rack=v.rack,
+                free_bytes=v.free_bytes,
+                held=tuple((s.job_id, s.rank) for s in v.shards),
+            )
+            for v in req.volumes
+        ]
+        try:
+            plan = plan_backup(jobs, job_ids, volumes, req.expandable_volume)
+        except BackupPlanError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return _plan_out(plan)
 
     return app
 
